@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native Ulysses SP requires the global sequence length to be divisible by ``sp_size``.
+"""Native Ulysses SP over sequences whose length is NOT divisible by ``sp_size``.
 
-``shard_sequence_batch`` splits the sequence with ``tensor.chunk(sp_size, dim=seq_dim)``, which is
-UNEVEN when ``seq_len % sp_size != 0`` (torch.chunk makes the last shard shorter). Every rank then
-feeds its local shard into the Ulysses ``all_to_all_single`` (``GatherSeqScatterHeads``), which
-requires an IDENTICAL ``[b, sp, H/sp, s, d]`` tensor on every rank — so uneven ``s`` is a hard
-distributed-collective size mismatch (gloo raises ``EnforceNotMet``; NCCL hangs/corrupts).
+The Ulysses ``all_to_all_single`` (``GatherSeqScatterHeads``) requires an IDENTICAL
+``[b, sp, H/sp, s, d]`` tensor on every rank, so the per-rank sequence shard must be EVEN. A raw
+``tensor.chunk(sp_size, dim=seq_dim)`` is uneven when ``seq_len % sp_size != 0`` (the last shard is
+shorter), which was a hard distributed-collective size mismatch (gloo ``EnforceNotMet``; NCCL
+hangs/corrupts).
 
-The library currently pushes this invariant onto the caller (see ``SEQLEN = 64  # must be divisible
-by sp_size`` in ``test_utils/scripts/external_deps/test_accelerate_ulysses_sp.py``) instead of
-padding. These CPU/gloo tests prove the failure mode; the first is ``xfail(strict=True)`` so it
-flips to a real failure — prompting removal of the marker — once ``shard_sequence_batch`` pads.
+``shard_sequence_batch`` now right-pads the global sequence to a multiple of ``sp_size`` (pads
+label-masked so they cost no loss and continue ``position_ids`` so they never form a spurious varlen
+boundary). These CPU/gloo tests prove the shard is even and the all-to-all no longer breaks for an
+indivisible length, plus a fast unit test that the pad is loss-masked.
 """
 
 import os
@@ -115,40 +115,48 @@ def _spawn(target, seq_len, world=SP_SIZE, get_timeout=60):
     return msgs, [p.exitcode for p in procs]
 
 
-@pytest.mark.parametrize(
-    "seq_len",
-    [
-        pytest.param(8, id="divisible"),
-        pytest.param(
-            7,
-            id="indivisible",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="shard_sequence_batch does not pad; seq_len % sp_size != 0 yields uneven "
-                "shards (remove this marker once padding lands)",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("seq_len", [pytest.param(8, id="divisible"), pytest.param(7, id="indivisible")])
 def test_shard_sequence_batch_produces_even_shards(seq_len):
-    """Ulysses requires every rank to hold the same shard length. ``shard_sequence_batch`` must
-    therefore split the sequence evenly across ``sp_size`` — it does for a divisible length and
-    (currently) does NOT for an indivisible one (``xfail``)."""
+    """Ulysses requires every rank to hold the same shard length, so ``shard_sequence_batch`` pads
+    to a multiple of ``sp_size`` before splitting — the shard is even for both a divisible length
+    and an indivisible one (padded up)."""
     msgs, _ = _spawn(_shard_len_worker, seq_len)
     assert msgs, "rank 0 did not report shard lengths"
     shard_lens = msgs[0]
     assert len(set(shard_lens)) == 1, f"uneven shards for seq_len={seq_len}: {shard_lens}"
 
 
-def test_ulysses_all_to_all_crashes_on_indivisible_seq_len():
-    """The concrete consequence: with an indivisible sequence the Ulysses ``all_to_all_single`` sees
-    mismatched per-rank tensor sizes — a hard distributed-collective failure (gloo aborts; NCCL would
-    hang/corrupt). The divisible case is the control and succeeds on every rank."""
-    _, exitcodes_ok = _spawn(_all_to_all_worker, 8)
-    assert all(c == 0 for c in exitcodes_ok), f"divisible seq should succeed, got exitcodes {exitcodes_ok}"
+@pytest.mark.parametrize("seq_len", [pytest.param(8, id="divisible"), pytest.param(7, id="indivisible")])
+def test_ulysses_all_to_all_handles_indivisible_seq_len(seq_len):
+    """The end-to-end consequence of padding: the Ulysses ``all_to_all_single`` now sees a matching
+    per-rank tensor size for both a divisible and an indivisible sequence, so every rank succeeds
+    (before padding, the indivisible case aborted with a collective size mismatch)."""
+    _, exitcodes = _spawn(_all_to_all_worker, seq_len)
+    assert all(c == 0 for c in exitcodes), f"seq_len={seq_len} should succeed, got exitcodes {exitcodes}"
 
-    _, exitcodes_bad = _spawn(_all_to_all_worker, 7)
-    assert not all(c == 0 for c in exitcodes_bad), (
-        "indivisible seq should break the Ulysses all-to-all, but every rank exited cleanly "
-        f"(exitcodes {exitcodes_bad}) — did padding get added?"
-    )
+
+def test_pad_masks_loss_and_continues_positions():
+    """Fast (no distributed) check of the pad itself: pad tokens are label-masked (``ignore_index``
+    in labels/shift_labels so they add no loss and drop out of ``num_items_in_batch``), and
+    ``position_ids`` continue past the last real position (no ``0`` reset that would fake a varlen
+    doc boundary)."""
+    from accelerate.utils.sequence_parallel import _pad_sequence_to_multiple
+
+    seq_len, ignore = 7, -100
+    batch = {
+        "input_ids": torch.arange(1, seq_len + 1).unsqueeze(0),  # [1,7], nonzero so pad (0) is distinct
+        "labels": torch.arange(1, seq_len + 1).unsqueeze(0),
+        "shift_labels": torch.arange(1, seq_len + 1).unsqueeze(0),
+        "position_ids": torch.arange(seq_len).unsqueeze(0),
+    }
+    padded, orig = _pad_sequence_to_multiple(dict(batch), multiple=4, seq_dim=1, ignore_index=ignore)
+    assert orig == seq_len
+    new_len = padded["input_ids"].shape[1]
+    assert new_len == 8 and new_len % 4 == 0  # 7 -> 8
+    pad = slice(seq_len, new_len)
+    assert torch.equal(padded["input_ids"][0, pad], torch.zeros(1, dtype=batch["input_ids"].dtype))
+    assert (padded["labels"][0, pad] == ignore).all(), "pad must not contribute to the loss"
+    assert (padded["shift_labels"][0, pad] == ignore).all()
+    # positions keep increasing (…6 -> 7); a reset to 0 would fabricate a varlen boundary
+    assert padded["position_ids"][0, seq_len].item() == seq_len
+    assert torch.equal(padded["input_ids"][0, :seq_len], batch["input_ids"][0]), "real tokens untouched"

@@ -152,19 +152,51 @@ def enable_ulysses_sp(model, sp_group):
 # Sequence-sharding primitive: shared by the dataloader adapter (SFT) and by callers that need to
 # shard an already-materialized batch at the forward (e.g. generated GRPO rollouts).
 # --------------------------------------------------------------------------------------
+def _pad_sequence_to_multiple(batch, multiple, seq_dim, ignore_index):
+    """Right-pad the sequence-dim tensors so the length is a multiple of ``multiple`` (needed so the
+    contiguous shard below is EVEN — the Ulysses all-to-all requires the same shard length on every
+    rank). Pads are label-masked (``ignore_index``) so they cost no loss and are excluded from
+    ``num_items_in_batch``; ``position_ids`` continue from the last position (no ``0`` reset) so the
+    pad joins the trailing document and never becomes a spurious varlen boundary, and causal
+    attention keeps real tokens from ever attending to it."""
+    ids = batch["input_ids"]
+    seq_len = ids.shape[seq_dim]
+    pad_len = (-seq_len) % multiple
+    if pad_len == 0:
+        return batch, seq_len
+    bsz = ids.shape[0]
+    device = ids.device
+
+    def _pad(t, value):
+        shape = list(t.shape)
+        shape[seq_dim] = pad_len
+        return torch.cat([t, torch.full(shape, value, dtype=t.dtype, device=t.device)], dim=seq_dim)
+
+    for key, value in (("input_ids", 0), ("labels", ignore_index), ("shift_labels", ignore_index)):
+        if batch.get(key) is not None:
+            batch[key] = _pad(batch[key], value)
+    if batch.get("position_ids") is not None:
+        pos = batch["position_ids"]
+        cont = pos[..., -1:] + torch.arange(1, pad_len + 1, device=device).expand(bsz, pad_len)
+        batch["position_ids"] = torch.cat([pos, cont], dim=seq_dim)
+    if batch.get("attention_mask") is not None:
+        batch["attention_mask"] = _pad(batch["attention_mask"], 0)
+    return batch, seq_len
+
+
 def shard_sequence_batch(batch, shard_group, attention=None, seq_dim=1, ignore_index=-100):
     """Contiguously shard a batch's sequence over ``shard_group`` for native Ulysses SP.
 
     ``prepare_data_loader`` already hands every shard rank the SAME sample (its data-parallel
     sharding divides out tp*cp*sp), so this only does the sequence split: it builds the GLOBAL
     ``position_ids``/``shift_labels`` (computed on the full sequence so shard boundaries keep
-    next-token alignment), pushes the GLOBAL packed ``cu_seqlens`` onto ``attention`` via
-    ``set_varlen`` (so packed/varlen batches take the flash-varlen path; ``cu_seqlens`` is NOT
-    sharded — it indexes the full sequence the all-to-all reconstitutes on each rank), then shards
+    next-token alignment), **right-pads the sequence to a multiple of the shard world size** so the
+    shard is even, pushes the GLOBAL packed ``cu_seqlens`` onto ``attention`` via ``set_varlen`` (so
+    packed/varlen batches take the flash-varlen path; ``cu_seqlens`` is NOT sharded — it indexes the
+    full sequence the all-to-all reconstitutes on each rank), then shards
     ``input_ids``/``labels``/``position_ids``/``shift_labels`` along ``seq_dim``.
 
-    Returns the local shard as a new dict (the input ``batch`` is not mutated). The caller is
-    responsible for ensuring the global sequence length is divisible by the shard world size.
+    Returns the local shard as a new dict (the input ``batch`` is not mutated).
 
     Args:
         batch: mapping with at least ``input_ids`` (and optionally ``labels``/``position_ids``).
@@ -175,8 +207,10 @@ def shard_sequence_batch(batch, shard_group, attention=None, seq_dim=1, ignore_i
     """
     rank, world = dist.get_rank(shard_group), dist.get_world_size(shard_group)
     batch = dict(batch)
+    if "input_ids" not in batch:
+        return batch
     # 1. global position_ids
-    if "position_ids" not in batch and "input_ids" in batch:
+    if "position_ids" not in batch:
         ids = batch["input_ids"]
         pos = torch.arange(ids.shape[seq_dim], device=ids.device).unsqueeze(0).expand(ids.shape[0], -1)
         batch["position_ids"] = pos.contiguous()
@@ -186,14 +220,18 @@ def shard_sequence_batch(batch, shard_group, attention=None, seq_dim=1, ignore_i
         shift = torch.full_like(labels, ignore_index)
         shift[..., :-1] = labels[..., 1:]
         batch["shift_labels"] = shift
-    # 3. packed/varlen: derive GLOBAL cu_seqlens from the (pre-shard) global position_ids and push
-    # onto the attention handler (packed iff position_ids reset more than once).
-    if attention is not None:
-        packed = "position_ids" in batch and int((batch["position_ids"][0] == 0).sum()) > 1
-        attention.set_varlen(*(_cu_seqlens_from_position_ids(batch["position_ids"]) if packed else (None, None)))
-    # 4. contiguous sequence shard across the group
+    # 3. pad the GLOBAL sequence up to a multiple of the shard world size so `chunk` is even
+    # (uneven shards are a hard Ulysses all-to-all size mismatch).
     if world > 1:
-        for key in ("input_ids", "labels", "position_ids", "shift_labels"):
+        batch, _ = _pad_sequence_to_multiple(batch, world, seq_dim, ignore_index)
+    # 4. packed/varlen: derive GLOBAL cu_seqlens from the (padded) global position_ids and push onto
+    # the attention handler (packed iff position_ids reset more than once).
+    if attention is not None:
+        packed = int((batch["position_ids"][0] == 0).sum()) > 1
+        attention.set_varlen(*(_cu_seqlens_from_position_ids(batch["position_ids"]) if packed else (None, None)))
+    # 5. contiguous (now EVEN) sequence shard across the group
+    if world > 1:
+        for key in ("input_ids", "labels", "position_ids", "shift_labels", "attention_mask"):
             t = batch.get(key)
             if t is not None:
                 batch[key] = t.chunk(world, dim=seq_dim)[rank].contiguous()
