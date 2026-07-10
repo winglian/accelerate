@@ -161,38 +161,135 @@ class UlyssesAttention:
 
 
 # --------------------------------------------------------------------------------------
-# Extensibility seam: a sequence-parallel *strategy* pairs a sequence sharder with an attention
-# transform, so the ``sp`` mesh dim can host Ulysses (here) or a Ring / USP / model-specific transform
-# (registered by a downstream lib) without touching the enable path or the accelerator wiring. Model
-# hooks let non-attention mixers (e.g. Mamba/SSM state passing) opt into the same ``sp`` group.
+# State-passing scan for recurrent mixers (Mamba/SSM, gated linear attention). A recurrent mixer
+# CANNOT gather like attention — the scan h_t = a_t*h_{t-1} + b_t has a left-to-right dependency. But
+# it is LINEAR in its initial state, so each rank scans its CONTIGUOUS chunk (h0=0), the per-chunk
+# (decay, carry) are combined across ranks to get the state entering each chunk, and an exact additive
+# correction is applied. Comm is O(P), sequence-length independent. Real Mamba2/GDN kernels realize
+# this via their initial_states/return_final_states args (see ringmaster.strategies.mamba); the
+# primitive below is the framework-neutral core.
+# --------------------------------------------------------------------------------------
+def local_linear_scan(a, b):
+    """Sequential reference scan ``h_t = a_t*h_{t-1} + b_t`` with zero init. ``a``, ``b``:
+    ``[batch, L, d]``. Returns ``[batch, L, d]``."""
+    h = torch.zeros_like(b[:, 0])
+    out = []
+    for t in range(a.shape[1]):
+        h = a[:, t] * h + b[:, t]
+        out.append(h)
+    return torch.stack(out, dim=1)
+
+
+def cp_linear_scan(a, b, group):
+    """Exact context-parallel linear scan; equals a global scan of the full sequence. ``a``, ``b`` are
+    THIS rank's contiguous chunk ``[batch, L_local, d]``. One all-gather of two ``[batch, d]`` vectors
+    (O(P), sequence-length independent) carries the boundary state across ranks."""
+    local_h = local_linear_scan(a, b)
+    world = dist.get_world_size(group) if group is not None else 1
+    if world == 1:
+        return local_h
+    cum_a = torch.cumprod(a, dim=1)  # [batch, L, d]
+    rank = dist.get_rank(group)
+    stacked = torch.stack([cum_a[:, -1], local_h[:, -1]], dim=0).contiguous()  # [2, batch, d]
+    gathered = [torch.empty_like(stacked) for _ in range(world)]
+    dist.all_gather(gathered, stacked, group=group)
+    h_in = torch.zeros_like(local_h[:, -1])  # state entering this chunk (prefix over predecessors)
+    for j in range(rank):
+        h_in = gathered[j][0] * h_in + gathered[j][1]
+    return local_h + cum_a * h_in.unsqueeze(1)
+
+
+# --------------------------------------------------------------------------------------
+# Extensibility seam: a sequence-parallel *strategy* pairs a sequence sharder with a per-mixer
+# transform. The unit of SP is the MIXER, not the model: ``enable_sequence_parallel(dispatch=...)``
+# routes each module to the strategy for its MECHANISM — dense-gather (Ulysses) for attention, state
+# passing for Mamba/SSM/GDN, or a model-specific transform (registered by a downstream lib). Uniform
+# dense attention collapses onto one shared ALL_ATTENTION_FUNCTIONS key (fast path); everything else is
+# wrapped per module.
 # --------------------------------------------------------------------------------------
 class SequenceParallelStrategy:
-    """Base class for a sequence-parallel backend. Subclasses pair sequence sharding with an
-    attention transform installed per-model over the ``sp`` group."""
+    """Base class for a sequence-parallel backend for one mixer *mechanism*.
+
+    A strategy installs one of two ways:
+      * ``installs_via_registry = True`` implements ``build_attention`` — installed by rebinding the
+        model's ``ALL_ATTENTION_FUNCTIONS`` key (dense attention, where all layers share the key and
+        the reused kernel handles causal/sliding/varlen).
+      * ``installs_via_registry = False`` implements ``wrap_module`` — a direct per-module forward wrap
+        (recurrent/sparse/custom mixers that don't route through the attention registry).
+    """
 
     name = "sequence_parallel"
     requires_kv_divisible = False
+    requires_contiguous_shard = False
+    installs_via_registry = False
 
     def shard_batch(self, batch, shard_group, seq_dim=1, ignore_index=-100):
-        raise NotImplementedError
+        return shard_sequence_batch(batch, shard_group, seq_dim=seq_dim, ignore_index=ignore_index)
 
     def build_attention(self, base_attn_fn, sp_group):
-        """Return the callable registered as the model's attention (wrapping ``base_attn_fn``)."""
+        """Registry-key install: return the callable registered as attention (wrapping ``base_attn_fn``)."""
+        raise NotImplementedError
+
+    def wrap_module(self, module, sp_group):
+        """Per-module install: wrap ``module`` in place over ``sp_group``; return the module."""
         raise NotImplementedError
 
 
 class UlyssesStrategy(SequenceParallelStrategy):
     name = "ulysses"
     requires_kv_divisible = True  # sp_size | num_kv_heads
-
-    def shard_batch(self, batch, shard_group, seq_dim=1, ignore_index=-100):
-        return shard_sequence_batch(batch, shard_group, seq_dim=seq_dim, ignore_index=ignore_index)
+    installs_via_registry = True
 
     def build_attention(self, base_attn_fn, sp_group):
         return UlyssesAttention(sp_group, base_attn_fn)
 
 
-_SP_STRATEGIES = {"ulysses": UlyssesStrategy}
+class StatePassingStrategy(SequenceParallelStrategy):
+    """CP for recurrent mixers (Mamba/SSM, GDN/linear-attention): scan the contiguous shard and pass
+    the boundary state across the ``sp`` group (``cp_linear_scan``). Installed per-module (recurrent
+    layers are not attention). Requires contiguous shards — the recurrence is ordered. A mixer opts in
+    by exposing its scan as ``module.sp_scan(a, b)``; real Mamba2/GDN kernels are wrapped analogously
+    (their ``initial_states``/``return_final_states`` are the state injection/extraction points)."""
+
+    name = "state_passing"
+    requires_contiguous_shard = True
+    installs_via_registry = False
+
+    def wrap_module(self, module, sp_group):
+        module._sp_group = sp_group
+        if hasattr(module, "sp_scan"):
+            module.sp_scan = lambda a, b, g=sp_group: cp_linear_scan(a, b, g)
+        return module
+
+
+# Name-based mixer classification (case-insensitive) so dispatch needs no per-architecture imports.
+_RECURRENT_HINTS = ("mamba", "gateddelta", "deltanet", "linearattention", "lineattention", "gateddeltanet")
+
+
+def is_recurrent_mixer(module) -> bool:
+    """True for Mamba/SSM or gated-linear-attention mixers (Nemotron-H, Falcon-H1, Granite-MoE-Hybrid,
+    Qwen3-Next/GDN, ...)."""
+    return any(h in type(module).__name__.lower() for h in _RECURRENT_HINTS)
+
+
+def is_attention_module(module) -> bool:
+    """True for a transformers attention submodule (routes through ``config._attn_implementation``)."""
+    cfg = getattr(module, "config", None)
+    return "attention" in type(module).__name__.lower() and cfg is not None and hasattr(cfg, "_attn_implementation")
+
+
+def default_sp_dispatch(module):
+    """Map a mixer module to the strategy for its MECHANISM (``None`` = the model owns SP for it, e.g.
+    a sparse-attention kernel doing its own compressed-KV gather — only sequence sharding applies).
+    Dense attention (full / sliding-window / sinks) is one mechanism → one Ulysses transform."""
+    if is_recurrent_mixer(module):
+        return StatePassingStrategy()
+    if is_attention_module(module):
+        return UlyssesStrategy()
+    return None
+
+
+_SP_STRATEGIES = {"ulysses": UlyssesStrategy, "state_passing": StatePassingStrategy}
 
 
 def register_sp_strategy(name, strategy_cls):
@@ -236,16 +333,65 @@ def _set_model_attn_impl(model, key):
             cfg._attn_implementation = key
 
 
-def enable_sequence_parallel(model, sp_group, strategy=None, backend="ulysses"):
-    """Enable sequence parallelism on ``model`` over ``sp_group`` using ``strategy`` (or the backend
-    registered under ``backend``). Installs the strategy's attention under a UNIQUE per-model impl key
-    (no global rebinding of other models' attention) and runs any registered model hooks. Returns the
-    attention handler."""
+def _install_registry_attention(model, attn_modules, strategy, sp_group):
+    """Collapse uniform dense attention onto ONE unique per-model impl key wrapping the base attention,
+    and point the given attention modules (and the text config) at it. Returns the shared handler."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    text_config = model.config.get_text_config()
+    impl = text_config._attn_implementation
+    # Unwrap on re-enable so we never wrap a wrapper (double all-to-all).
+    base = _SP_ATTN_BASES.get(impl, ALL_ATTENTION_FUNCTIONS[impl])
+    handler = strategy.build_attention(base, sp_group)
+    key = f"{impl}__{strategy.name}_sp_{next(_SP_ATTN_COUNTER)}"
+    ALL_ATTENTION_FUNCTIONS[key] = handler
+    _SP_ATTN_BASES[key] = base
+    text_config._attn_implementation = key
+    for module in attn_modules:
+        cfg = getattr(module, "config", None)
+        if cfg is not None and hasattr(cfg, "_attn_implementation"):
+            cfg._attn_implementation = key
+    return handler
+
+
+def _enable_per_module(model, sp_group, dispatch):
+    """Walk the model and install each mixer's strategy: dense attention collapses onto one registry
+    key (fast path), other mixers are wrapped in place. Returns the attention handler (or None)."""
+    assigned = [(m, dispatch(m)) for m in model.modules()]
+    assigned = [(m, s) for m, s in assigned if s is not None]
+    if any(s.requires_kv_divisible for _, s in assigned):
+        _check_kv_divisible(model, dist.get_world_size(sp_group))
+
+    attn_modules = [m for m, s in assigned if s.installs_via_registry]
+    attention_handler = None
+    if attn_modules:
+        strategy = next(s for _, s in assigned if s.installs_via_registry)
+        attention_handler = _install_registry_attention(model, attn_modules, strategy, sp_group)
+    for module, strategy in assigned:
+        if not strategy.installs_via_registry:
+            strategy.wrap_module(module, sp_group)
+
+    for hook in _SP_MODEL_HOOKS:
+        hook(model, sp_group)
+    return attention_handler
+
+
+def enable_sequence_parallel(model, sp_group, strategy=None, backend="ulysses", dispatch=None):
+    """Enable sequence parallelism on ``model`` over ``sp_group``.
+
+    ``dispatch(module) -> strategy | None`` routes each mixer to the strategy for its mechanism (use
+    :func:`default_sp_dispatch` for hybrid models: attention -> Ulysses, Mamba/GDN -> state passing).
+    Without ``dispatch`` the whole model uses a single ``strategy`` / ``backend`` (uniform dense
+    attention). Either way the attention transform is installed under a UNIQUE per-model impl key (no
+    global rebinding of other models' attention). Returns the attention handler."""
     if not hasattr(model, "config"):
         raise ValueError(
             f"Sequence parallelism expects a HF Transformers model with a `config` attribute, got "
             f"{type(model).__name__}."
         )
+    if dispatch is not None:
+        return _enable_per_module(model, sp_group, dispatch)
+
     strategy = strategy or get_sp_strategy(backend)
     if strategy.requires_kv_divisible:
         _check_kv_divisible(model, dist.get_world_size(sp_group))
