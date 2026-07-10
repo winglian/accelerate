@@ -11,14 +11,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Native (torch-only) Ulysses sequence parallelism; flash kernel or sdpa, no DeepSpeed. Routes the
-model through the handler by overwriting its active attn impl (``override_attention``); state on
-the handler, no globals.
+Native (torch-only) Ulysses sequence parallelism; flash kernel or sdpa, no DeepSpeed.
 
-Ulysses: each rank holds a 1/sp sequence shard (all heads); an all-to-all re-shards q/k/v to
-(1/sp heads, full sequence), one local attention runs, the inverse all-to-all restores the layout.
-Requires sp_size | num_kv_heads.
+Ulysses: each rank holds a 1/sp contiguous sequence shard (all heads); an all-to-all re-shards q/k/v
+to (1/sp heads, full sequence), the model's own attention runs, and the inverse all-to-all restores
+the layout. Requires sp_size | num_kv_heads.
+
+`enable_sequence_parallel` installs the attention transform per-module (a dispatcher under the real
+`_attn_implementation` key routes tagged modules through the handler), so it never rebinds another
+model's attention and keeps the key valid for flash-kernel resolution. It routes each mixer to a
+`SequenceParallelStrategy` via an optional `dispatch` — the seam for hybrid models and downstream
+backends (Ring/USP, Mamba/SSM state passing). Ulysses is the built-in strategy; USP (Ulysses x Ring)
+is scaffolded — a strategy reads whatever sub-dims it needs off the `SPContext` mesh — with its ring
+leg stubbed. `register_sp_strategy` / `register_sp_model_hook` are the extension points.
+
+`shard_sequence_batch` builds global position_ids/shift_labels, pads the sequence to a multiple of the
+sp size (so shards are even), and shards contiguously. Packed/varlen cu_seqlens are self-derived inside
+the attention from the sharded position_ids, so there is no dataloader -> handler side channel.
 """
+
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -33,7 +46,8 @@ def _cu_seqlens_from_position_ids(position_ids):
 
 
 def _check_kv_divisible(model, sp_size):
-    n_kv = model.config.get_text_config().num_key_value_heads
+    text_config = model.config.get_text_config()
+    n_kv = getattr(text_config, "num_key_value_heads", None) or text_config.num_attention_heads
     if n_kv % sp_size:
         raise ValueError(f"sp_size={sp_size} must divide num_key_value_heads={n_kv} for Ulysses.")
 
@@ -104,14 +118,33 @@ class UlyssesAttention:
         self.sp_group = sp_group
         self.sp_size = dist.get_world_size(sp_group)
         self.attn_fn = attn_fn  # the model's original HF attention, captured before we override it
-        self.cu_seqlens = None
-        self.max_seqlen = None
+        self._cache_ptr = None
+        self._cu_seqlens = None
+        self._max_seqlen = None
 
-    def set_varlen(self, cu_seqlens, max_seqlen):
-        self.cu_seqlens, self.max_seqlen = cu_seqlens, max_seqlen
+    def set_varlen(self, cu_seqlens, max_seqlen):  # noqa: D401 - back-compat shim
+        """Deprecated no-op: varlen ``cu_seqlens`` are now self-derived from ``position_ids``."""
+
+    def _global_cu_seqlens(self, local_position_ids):
+        """GLOBAL packed cu_seqlens (or ``(None, None)`` when unpacked) from the rank-local
+        ``position_ids`` the model threads in: all-gather across the sp group to rebuild the
+        full-sequence positions, then read the doc boundaries. Memoized on the ``position_ids`` storage
+        so N attention layers share one gather per step — no dataloader -> handler side channel."""
+        if local_position_ids is None or self.sp_size == 1:
+            return None, None
+        key = local_position_ids.data_ptr()
+        if key != self._cache_ptr:
+            gathered = [torch.empty_like(local_position_ids) for _ in range(self.sp_size)]
+            dist.all_gather(gathered, local_position_ids.contiguous(), group=self.sp_group)
+            global_pos = torch.cat(gathered, dim=-1)
+            packed = int((global_pos[0] == 0).sum()) > 1
+            self._cu_seqlens, self._max_seqlen = _cu_seqlens_from_position_ids(global_pos) if packed else (None, None)
+            self._cache_ptr = key
+        return self._cu_seqlens, self._max_seqlen
 
     def __call__(self, module, query, key, value, attention_mask, **kwargs):
         group, sp = self.sp_group, self.sp_size
+        cu_seqlens, max_seqlen = self._global_cu_seqlens(kwargs.get("position_ids"))
         # heads -> full sequence, then to HF's [b, h, S, d] layout
         q = GatherSeqScatterHeads.apply(query, group, sp).transpose(1, 2)
         k = GatherSeqScatterHeads.apply(key, group, sp).transpose(1, 2)
@@ -120,57 +153,293 @@ class UlyssesAttention:
         # length); re-inject the GLOBAL packed cu_seqlens for the full sequence the all-to-all rebuilt.
         for k_ in ("position_ids", "cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
             kwargs.pop(k_, None)
-        if self.cu_seqlens is not None:
-            kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = self.cu_seqlens.to(q.device)
-            kwargs["max_length_q"] = kwargs["max_length_k"] = self.max_seqlen
+        if cu_seqlens is not None:
+            kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = cu_seqlens.to(q.device)
+            kwargs["max_length_q"] = kwargs["max_length_k"] = max_seqlen
         out, _ = self.attn_fn(module, q, k, v, None, **kwargs)
         return GatherHeadsScatterSeq.apply(out, group, sp), None
 
 
-def enable_ulysses_sp(model, sp_group):
-    """Register pure Ulysses SP on ``model`` over ``sp_group``, reusing the model's own attention.
-    Returns the handler (a dataloader pushes per-step varlen via ``handler.set_varlen``)."""
-    # Ulysses swaps the model's HF attention, so it must be a transformers model (same check as ALST).
-    if not hasattr(model, "config"):
-        raise ValueError(
-            f"Ulysses SP expects a HF Transformers model with a `config` attribute, got {type(model).__name__}."
+# Extensibility seam: each mixer gets a `SequenceParallelStrategy` for its mechanism, installed either
+# by rebinding the attention registry key (dense attention) or by a per-module wrap (recurrent/sparse).
+# Ulysses is the only built-in; register_sp_strategy / register_sp_model_hook are the extension points.
+@dataclass
+class SPContext:
+    """What a strategy is handed. `group` is the full CP degree (sharding, hooks, and any strategy
+    that uses the whole degree — Ulysses, Ring, state passing, DSA). `mesh` is the sp (sub-)mesh when
+    one was built, so a strategy that decomposes the degree reads whatever named sub-dims IT needs
+    (e.g. USP reads `ulysses`/`ring`); it is `None` for a bare process group."""
+
+    group: "dist.ProcessGroup"
+    mesh: Optional[object] = None
+
+
+# The sequence-parallel axes of a device mesh; the rest (dp/tp/ep) compose orthogonally.
+_SP_MESH_DIMS = ("ulysses", "ring", "sp", "cp")
+
+
+def sp_context_from_mesh(mesh, seq_dims=None) -> SPContext:
+    """Wrap a device mesh in an `SPContext`. `group` is the sequence axis (the `seq_dims`, defaulting
+    to the recognized sequence-parallel dims); the WHOLE mesh is kept on `ctx.mesh` so a strategy can
+    read its own sub-dims (USP's `ulysses`/`ring`) or a composing axis (`tp`/`ep`) — pass the full ND
+    mesh here, not a pre-sliced group."""
+    dims = mesh.mesh_dim_names or ()
+    seq = list(seq_dims) if seq_dims else [d for d in dims if d in _SP_MESH_DIMS]
+    if len(seq) == 1:
+        group = mesh[seq[0]].get_group()
+    elif len(seq) > 1:
+        group = mesh[tuple(seq)]._flatten().get_group()
+    else:
+        group = mesh[dims[0]].get_group() if dims else mesh.get_group()
+    return SPContext(group, mesh)
+
+
+def _to_sp_context(sp) -> SPContext:
+    if isinstance(sp, SPContext):
+        return sp
+    if hasattr(sp, "mesh_dim_names"):  # a torch DeviceMesh
+        return sp_context_from_mesh(sp)
+    return SPContext(sp)  # a bare ProcessGroup
+
+
+class SequenceParallelStrategy:
+    """Base class pairing a sequence sharder with a per-mixer transform. Strategies implement
+    `build_attention(base_attn_fn, ctx)` (registry-key install) or `wrap_module` (per-module install),
+    and may override `validate` to check model/topology requirements."""
+
+    name = "sequence_parallel"
+    requires_contiguous_shard = False
+    installs_via_registry = False
+
+    def validate(self, model, ctx: SPContext):
+        """Raise if the model/topology can't support this strategy (e.g. head divisibility)."""
+
+    def shard_batch(self, batch, shard_group, seq_dim=1, ignore_index=-100):
+        return shard_sequence_batch(batch, shard_group, seq_dim=seq_dim, ignore_index=ignore_index)
+
+    def build_attention(self, base_attn_fn, ctx: SPContext):
+        """Registry-key install: return the attention callable wrapping `base_attn_fn`."""
+        raise NotImplementedError
+
+    def wrap_module(self, module, sp_group):
+        """Per-module install: wrap `module` in place over `sp_group`; return it."""
+        raise NotImplementedError
+
+
+class UlyssesStrategy(SequenceParallelStrategy):
+    """Ulysses attention over the whole CP group. Requires `sp_size | num_kv_heads`."""
+
+    name = "ulysses"
+    installs_via_registry = True
+
+    def validate(self, model, ctx: SPContext):
+        _check_kv_divisible(model, dist.get_world_size(ctx.group))
+
+    def build_attention(self, base_attn_fn, ctx: SPContext):
+        return UlyssesAttention(ctx.group, base_attn_fn)
+
+
+class UspAttention:
+    """USP (Unified SP): Ulysses all-to-all over the intra-node `ulysses_group`, then ring attention
+    over the inter-node `ring_group`, then the inverse. With `ring_size == 1` it degenerates to pure
+    Ulysses. The ring leg is a stub here — a downstream backend (e.g. ringmaster) provides it; this
+    establishes that the seam plumbs both groups to the transform."""
+
+    def __init__(self, ulysses_group, ring_group, attn_fn):
+        self.attn_fn = attn_fn
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
+        self.ring_size = dist.get_world_size(ring_group) if ring_group is not None else 1
+        self._ulysses = UlyssesAttention(ulysses_group, attn_fn)
+
+    def __call__(self, module, query, key, value, attention_mask, **kwargs):
+        if self.ring_size == 1:  # no inter-node ring dim -> plain Ulysses over the ulysses group
+            return self._ulysses(module, query, key, value, attention_mask, **kwargs)
+        raise NotImplementedError(
+            "USP inter-node ring leg is not implemented in accelerate; register a downstream strategy "
+            "(e.g. ringmaster) that provides ring attention over `ring_group`."
         )
+
+
+class UspStrategy(SequenceParallelStrategy):
+    """Ulysses (intra-node) x Ring (inter-node), read off the `ulysses`/`ring` mesh dims. The Ulysses
+    degree (not the full degree) must divide the KV heads; the ring leg is stubbed (provided
+    downstream)."""
+
+    name = "usp"
+    installs_via_registry = True
+
+    def _groups(self, ctx: SPContext):
+        dims = getattr(ctx.mesh, "mesh_dim_names", None) or ()
+        if "ulysses" not in dims or "ring" not in dims:
+            raise ValueError(f"USP needs an sp mesh with `ulysses` and `ring` dims (got mesh dims {dims!r})")
+        return ctx.mesh["ulysses"].get_group(), ctx.mesh["ring"].get_group()
+
+    def validate(self, model, ctx: SPContext):
+        ulysses_group, _ = self._groups(ctx)
+        _check_kv_divisible(model, dist.get_world_size(ulysses_group))
+
+    def build_attention(self, base_attn_fn, ctx: SPContext):
+        ulysses_group, ring_group = self._groups(ctx)
+        return UspAttention(ulysses_group, ring_group, base_attn_fn)
+
+
+_SP_STRATEGIES = {"ulysses": UlyssesStrategy, "usp": UspStrategy}
+
+
+def register_sp_strategy(name, strategy_cls):
+    """Register a sequence-parallel strategy under `name` (e.g. a downstream Ring/USP/state-passing backend)."""
+    _SP_STRATEGIES[name] = strategy_cls
+
+
+def get_sp_strategy(name):
+    if name not in _SP_STRATEGIES:
+        raise ValueError(f"unknown sequence-parallel strategy {name!r}; registered: {sorted(_SP_STRATEGIES)}")
+    return _SP_STRATEGIES[name]()
+
+
+_SP_MODEL_HOOKS = []
+
+
+def register_sp_model_hook(fn):
+    """Register `fn(model, sp_group)` to run when SP is enabled — the seam for non-attention mixers
+    (e.g. Mamba/SSM state passing) to wire onto the `sp` group. Returns `fn`."""
+    _SP_MODEL_HOOKS.append(fn)
+    return fn
+
+
+def is_attention_module(module) -> bool:
+    """True for a transformers attention submodule (routes through `config._attn_implementation`)."""
+    cfg = getattr(module, "config", None)
+    return "attention" in type(module).__name__.lower() and cfg is not None and hasattr(cfg, "_attn_implementation")
+
+
+def default_sp_dispatch(module):
+    """Dense attention -> Ulysses; everything else -> `None` (a downstream dispatch covers other mixers)."""
+    if is_attention_module(module):
+        return UlyssesStrategy()
+    return None
+
+
+def _make_sp_dispatcher(base):
+    """Wrap the base attention so it routes per-module: an SP-enabled module (tagged with
+    ``_sp_handler``) goes through its handler, any other module falls back to the base. Installed once
+    under the real ``_attn_implementation`` key, so it never rebinds another model's attention and
+    keeps the key valid for transformers' flash-kernel / mask resolution (which reads it verbatim)."""
+
+    def dispatcher(module, query, key, value, attention_mask, **kwargs):
+        handler = getattr(module, "_sp_handler", None)
+        if handler is not None:
+            return handler(module, query, key, value, attention_mask, **kwargs)
+        return base(module, query, key, value, attention_mask, **kwargs)
+
+    dispatcher._sp_base = base
+    return dispatcher
+
+
+def _install_registry_attention(model, attn_modules, strategy, ctx):
+    """Install the per-module dispatcher under the model's ``_attn_implementation`` and tag the given
+    attention modules with this model's handler. ``_attn_implementation`` is left unchanged. Returns
+    the handler."""
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    _check_kv_divisible(model, dist.get_world_size(sp_group))
-    # Capture the model's ORIGINAL attention. If SP was already enabled (re-prepare, second model),
-    # the registered entry is our own handler — unwrap it so we don't wrap a wrapper (double all-to-all).
-    attn_impl_str = model.config.get_text_config()._attn_implementation
-    current = ALL_ATTENTION_FUNCTIONS[attn_impl_str]
-    base = current.attn_fn if isinstance(current, UlyssesAttention) else current
-    handler = UlyssesAttention(sp_group, base)
-    ALL_ATTENTION_FUNCTIONS[attn_impl_str] = handler
+    impl = model.config.get_text_config()._attn_implementation
+    current = ALL_ATTENTION_FUNCTIONS[impl]
+    base = getattr(current, "_sp_base", current)  # unwrap if the dispatcher is already installed
+    if getattr(current, "_sp_base", None) is None:
+        ALL_ATTENTION_FUNCTIONS[impl] = _make_sp_dispatcher(base)
+    handler = strategy.build_attention(base, ctx)
+    for module in attn_modules:
+        module._sp_handler = handler
     return handler
 
 
-# --------------------------------------------------------------------------------------
-# Sequence-sharding primitive: shared by the dataloader adapter (SFT) and by callers that need to
-# shard an already-materialized batch at the forward (e.g. generated GRPO rollouts).
-# --------------------------------------------------------------------------------------
+def enable_sequence_parallel(model, sp_group, strategy=None, backend="ulysses", dispatch=None):
+    """Enable sequence parallelism on `model` over `sp_group`.
+
+    `sp_group` may be a ProcessGroup (pure Ulysses over the whole group), a device mesh (factored into
+    ulysses/ring for USP by `sp_context_from_mesh`), or an `SPContext`. `dispatch(module) -> strategy |
+    None` routes each mixer to its strategy (the seam for hybrid models); without it the whole model
+    uses one `strategy` / `backend`. The attention transform is installed per-module (via a dispatcher
+    under the real impl key), so it never rebinds another model's attention. Returns the handler."""
+    if not hasattr(model, "config"):
+        raise ValueError(
+            f"Sequence parallelism expects a HF Transformers model with a `config` attribute, got "
+            f"{type(model).__name__}."
+        )
+    ctx = _to_sp_context(sp_group)
+    if dispatch is not None:
+        assigned = [(m, dispatch(m)) for m in model.modules()]
+        assigned = [(m, s) for m, s in assigned if s is not None]
+        for _, strat in assigned:
+            strat.validate(model, ctx)
+        attn_modules = [m for m, s in assigned if s.installs_via_registry]
+        handler = None
+        if attn_modules:
+            strat = next(s for _, s in assigned if s.installs_via_registry)
+            handler = _install_registry_attention(model, attn_modules, strat, ctx)
+        for module, strat in assigned:
+            if not strat.installs_via_registry:
+                strat.wrap_module(module, ctx.group)
+        for hook in _SP_MODEL_HOOKS:
+            hook(model, ctx.group)
+        return handler
+
+    strategy = strategy or get_sp_strategy(backend)
+    strategy.validate(model, ctx)
+    # Model-wide: tag every module (the dispatcher only fires for the ones that call the attention
+    # interface) so this model's attention routes through the handler regardless of layer naming.
+    handler = _install_registry_attention(model, list(model.modules()), strategy, ctx)
+    for hook in _SP_MODEL_HOOKS:
+        hook(model, ctx.group)
+    return handler
+
+
+def enable_ulysses_sp(model, sp_group):
+    """Back-compat wrapper: enable native Ulysses SP on ``model`` over ``sp_group``. Prefer
+    :func:`enable_sequence_parallel`."""
+    return enable_sequence_parallel(model, sp_group, backend="ulysses")
+
+
+def _pad_sequence_to_multiple(batch, multiple, seq_dim, ignore_index):
+    """Right-pad the sequence-dim tensors to a multiple of ``multiple``. Pads are label-masked and
+    ``position_ids`` continue from the last position, so they add no loss and form no varlen boundary."""
+    ids = batch["input_ids"]
+    pad_len = (-ids.shape[seq_dim]) % multiple
+    if pad_len == 0:
+        return batch
+
+    def _pad(t, value):
+        shape = list(t.shape)
+        shape[seq_dim] = pad_len
+        return torch.cat([t, torch.full(shape, value, dtype=t.dtype, device=t.device)], dim=seq_dim)
+
+    for key, value in (("input_ids", 0), ("labels", ignore_index), ("shift_labels", ignore_index)):
+        if batch.get(key) is not None:
+            batch[key] = _pad(batch[key], value)
+    if batch.get("attention_mask") is not None:
+        batch["attention_mask"] = _pad(batch["attention_mask"], 0)
+    if batch.get("position_ids") is not None:
+        pos = batch["position_ids"]
+        cont = pos[..., -1:] + torch.arange(1, pad_len + 1, device=pos.device).expand(pos.shape[0], pad_len)
+        batch["position_ids"] = torch.cat([pos, cont], dim=seq_dim)
+    return batch
+
+
+# Shared by the dataloader adapter (SFT) and callers that shard an already-materialized batch at the
+# forward (e.g. generated GRPO rollouts).
 def shard_sequence_batch(batch, shard_group, attention=None, seq_dim=1, ignore_index=-100):
     """Contiguously shard a batch's sequence over ``shard_group`` for native Ulysses SP.
 
-    ``prepare_data_loader`` already hands every shard rank the SAME sample (its data-parallel
-    sharding divides out tp*cp*sp), so this only does the sequence split: it builds the GLOBAL
-    ``position_ids``/``shift_labels`` (computed on the full sequence so shard boundaries keep
-    next-token alignment), pushes the GLOBAL packed ``cu_seqlens`` onto ``attention`` via
-    ``set_varlen`` (so packed/varlen batches take the flash-varlen path; ``cu_seqlens`` is NOT
-    sharded — it indexes the full sequence the all-to-all reconstitutes on each rank), then shards
-    ``input_ids``/``labels``/``position_ids``/``shift_labels`` along ``seq_dim``.
-
-    Returns the local shard as a new dict (the input ``batch`` is not mutated). The caller is
-    responsible for ensuring the global sequence length is divisible by the shard world size.
+    Builds the GLOBAL ``position_ids``/``shift_labels`` (shifted on the full sequence so shard
+    boundaries keep next-token alignment), pads the sequence to a multiple of the world size (so the
+    shard is even), then shards along ``seq_dim``. Packed/varlen ``cu_seqlens`` are self-derived in the
+    attention from the sharded ``position_ids`` — no side channel. Returns a new dict (input unchanged).
 
     Args:
         batch: mapping with at least ``input_ids`` (and optionally ``labels``/``position_ids``).
         shard_group: the sequence-shard (``sp``) process group.
-        attention: the Ulysses attention handler; packed batches push the GLOBAL cu_seqlens onto it.
-            ``None`` to disable varlen.
+        attention: deprecated / unused (kept for back-compat; varlen is self-derived).
         seq_dim: the sequence dimension. ignore_index: final-token / pad label id.
     """
     rank, world = dist.get_rank(shard_group), dist.get_world_size(shard_group)
@@ -186,14 +455,14 @@ def shard_sequence_batch(batch, shard_group, attention=None, seq_dim=1, ignore_i
         shift = torch.full_like(labels, ignore_index)
         shift[..., :-1] = labels[..., 1:]
         batch["shift_labels"] = shift
-    # 3. packed/varlen: derive GLOBAL cu_seqlens from the (pre-shard) global position_ids and push
-    # onto the attention handler (packed iff position_ids reset more than once).
-    if attention is not None:
-        packed = "position_ids" in batch and int((batch["position_ids"][0] == 0).sum()) > 1
-        attention.set_varlen(*(_cu_seqlens_from_position_ids(batch["position_ids"]) if packed else (None, None)))
-    # 4. contiguous sequence shard across the group
+    # 3. pad to a multiple of the world size so the shard is EVEN (uneven shards are a hard Ulysses
+    # all-to-all size mismatch); pads are label-masked and continue position_ids (no varlen boundary).
     if world > 1:
-        for key in ("input_ids", "labels", "position_ids", "shift_labels"):
+        batch = _pad_sequence_to_multiple(batch, world, seq_dim, ignore_index)
+    # 4. contiguous (even) sequence shard. varlen cu_seqlens are self-derived in the attention from the
+    # sharded position_ids, so there is no side channel here (`attention` is unused).
+    if world > 1:
+        for key in ("input_ids", "labels", "position_ids", "shift_labels", "attention_mask"):
             t = batch.get(key)
             if t is not None:
                 batch[key] = t.chunk(world, dim=seq_dim)[rank].contiguous()
@@ -214,13 +483,15 @@ class SequenceShardingDataLoader:
     Args:
         dataloader: the accelerate-prepared DataLoader to wrap (must hand sp ranks the same sample).
         shard_group: the sequence-shard (``sp``) group.
-        attention: the attention handler; packed batches push the GLOBAL cu_seqlens onto it
-            (``set_varlen``). None to disable varlen.
+        strategy: the sequence-parallel strategy whose ``shard_batch`` decides the layout (e.g. a Ring
+            strategy that wants zigzag). ``None`` uses the contiguous default.
+        attention: deprecated / unused (kept for back-compat; varlen is self-derived).
         seq_dim / ignore_index: sequence dim / final-token label id.
     """
 
-    def __init__(self, dataloader, shard_group, attention=None, seq_dim=1, ignore_index=-100):
+    def __init__(self, dataloader, shard_group, strategy=None, attention=None, seq_dim=1, ignore_index=-100):
         self.dataloader = dataloader
+        self.strategy = strategy
         self.attention = attention
         self.seq_dim = seq_dim
         self.ignore_index = ignore_index
@@ -236,8 +507,10 @@ class SequenceShardingDataLoader:
             yield self._process(dict(batch))
 
     def _process(self, batch):
-        # accelerate's prepare_data_loader already hands every sp rank the SAME sample, so this just
-        # builds the global position_ids / shift_labels and shards the sequence over the sp group.
-        return shard_sequence_batch(
-            batch, self.shard_group, attention=self.attention, seq_dim=self.seq_dim, ignore_index=self.ignore_index
-        )
+        # The strategy owns the shard layout (contiguous for Ulysses, zigzag for a causal ring, ...);
+        # `None` falls back to the contiguous default.
+        if self.strategy is not None:
+            return self.strategy.shard_batch(
+                batch, self.shard_group, seq_dim=self.seq_dim, ignore_index=self.ignore_index
+            )
+        return shard_sequence_batch(batch, self.shard_group, seq_dim=self.seq_dim, ignore_index=self.ignore_index)

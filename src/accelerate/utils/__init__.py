@@ -210,9 +210,19 @@ from .operations import (
     slice_tensors,
 )
 from .sequence_parallel import (
+    SequenceParallelStrategy,
     SequenceShardingDataLoader,
+    SPContext,
+    UlyssesStrategy,
+    UspStrategy,
+    default_sp_dispatch,
+    enable_sequence_parallel,
     enable_ulysses_sp,
+    is_attention_module,
+    register_sp_model_hook,
+    register_sp_strategy,
     shard_sequence_batch,
+    sp_context_from_mesh,
 )
 from .versions import compare_versions, is_torch_version
 
