@@ -210,8 +210,13 @@ from .operations import (
     slice_tensors,
 )
 from .sequence_parallel import (
+    SequenceParallelStrategy,
     SequenceShardingDataLoader,
+    UlyssesStrategy,
+    enable_sequence_parallel,
     enable_ulysses_sp,
+    register_sp_model_hook,
+    register_sp_strategy,
     shard_sequence_batch,
 )
 from .versions import compare_versions, is_torch_version
