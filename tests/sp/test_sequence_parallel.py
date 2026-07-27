@@ -153,6 +153,54 @@ def test_pad_masks_loss_and_continues_positions():
     assert torch.equal(padded["input_ids"][0, :7], batch["input_ids"][0])
 
 
+def test_pad_tolerates_missing_input_ids():
+    # already-embedded / partial batches must not KeyError; length is read from any sequence tensor
+    batch = {"position_ids": torch.arange(7).unsqueeze(0)}
+    padded = sp._pad_sequence_to_multiple(dict(batch), 4, seq_dim=1, ignore_index=-100)
+    assert padded["position_ids"].shape[1] == 8
+    assert sp._pad_sequence_to_multiple({}, 4, seq_dim=1, ignore_index=-100) == {}
+
+
+def _padding_guard_worker(rank, world, left_pad, port, q):
+    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world, timeout=timedelta(seconds=30))
+    try:
+        mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]]) if left_pad else torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        batch = {"input_ids": torch.arange(8).unsqueeze(0), "attention_mask": mask}
+        try:
+            sp.shard_sequence_batch(batch, dist.group.WORLD)
+            raised = False
+        except ValueError:
+            raised = True
+        if rank == 0:
+            q.put(raised)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("left_pad", [pytest.param(True, id="left-rejected"), pytest.param(False, id="right-ok")])
+def test_padding_mask_guard(left_pad):
+    # the Ulysses attention drops the padding mask on the gathered sequence: right-padding is safe
+    # under causal attention (pads only see pads), left/interior padding must fail loudly
+    msgs, exitcodes = _spawn(_padding_guard_worker, left_pad)
+    assert all(c == 0 for c in exitcodes) and msgs, f"workers failed: {exitcodes}"
+    assert msgs[0] is left_pad
+
+
+def test_packed_mask_is_block_diagonal_causal(sp_world1):
+    handler = sp.UlyssesAttention(sp_world1, attn_fn=None)
+    handler._global_pos = torch.tensor([[0, 1, 2, 0, 1, 2]])  # two docs of 3 tokens
+    mask = handler._packed_attention_mask(torch.float32, torch.device("cpu"))
+    assert mask.shape == (1, 1, 6, 6)
+    neg = torch.finfo(torch.float32).min
+    keep = mask[0, 0] != neg
+    expected = torch.zeros(6, 6, dtype=torch.bool)
+    for start in (0, 3):  # causal within each doc, nothing across the boundary
+        expected[start : start + 3, start : start + 3] = torch.tril(torch.ones(3, 3, dtype=torch.bool))
+    assert torch.equal(keep, expected)
+    assert handler._packed_attention_mask(torch.float32, torch.device("cpu")) is mask  # cached
+
+
 # --------------------------------------------------------------------------- self-derived varlen
 def _cu_worker(rank, world, packed, port, q):
     os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
@@ -166,6 +214,46 @@ def _cu_worker(rank, world, packed, port, q):
             q.put((None if cu is None else cu.tolist(), max_len))
     finally:
         dist.destroy_process_group()
+
+
+def _cu_cache_worker(rank, world, _arg, port, q):
+    """The varlen cache is keyed on tensor IDENTITY: same tensor -> one gather; a new tensor —
+    even one the allocator could have placed at the old data_ptr — re-derives."""
+    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world, timeout=timedelta(seconds=30))
+    try:
+        gathers = 0
+        real_all_gather = sp.dist.all_gather
+
+        def counting_all_gather(*a, **kw):
+            nonlocal gathers
+            gathers += 1
+            return real_all_gather(*a, **kw)
+
+        sp.dist.all_gather = counting_all_gather
+        try:
+            handler = sp.UlyssesAttention(dist.group.WORLD, attn_fn=None)
+            packed = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]).chunk(world, dim=1)[rank].contiguous()
+            first = handler._global_cu_seqlens(packed)
+            again = handler._global_cu_seqlens(packed)  # same object -> cache hit, no gather
+            # new tensor, same shape, different (unpacked) contents -> must re-derive, not reuse
+            unpacked = torch.arange(8).unsqueeze(0).chunk(world, dim=1)[rank].contiguous()
+            second = handler._global_cu_seqlens(unpacked)
+        finally:
+            sp.dist.all_gather = real_all_gather
+        if rank == 0:
+            q.put((first[0].tolist(), again[0].tolist(), second[0], gathers))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_varlen_cache_rederives_for_new_tensor():
+    msgs, exitcodes = _spawn(_cu_cache_worker, None)
+    assert all(c == 0 for c in exitcodes) and msgs, f"workers failed: {exitcodes}"
+    first, again, second, gathers = msgs[0]
+    assert first == again == [0, 4, 8]  # packed boundaries, stable across the cache hit
+    assert second is None  # the new (unpacked) tensor was re-derived, not served stale
+    assert gathers == 2  # one gather per distinct tensor, none for the repeat
 
 
 def test_attention_self_derives_cu_seqlens_packed():
@@ -253,6 +341,45 @@ def test_model_hook_runs_on_enable(sp_world1, clean_registries):
     model = _Model()
     sp.enable_sequence_parallel(model, sp_world1)
     assert calls == [(model, sp_world1)]
+
+
+def test_dispatch_builds_one_handler_per_registry_strategy_type(sp_world1, clean_registries):
+    # two attention modules routed to two different registry strategies -> each gets ITS strategy's
+    # handler; modules sharing a strategy type share ONE handler (and its per-step varlen gather)
+    class _AltAttention:
+        def __init__(self, sp_group, attn_fn):
+            self.sp_group, self.attn_fn = sp_group, attn_fn
+
+        def __call__(self, module, q, k, v, mask, **kw):
+            return q, None
+
+    class _AltStrategy(sp.SequenceParallelStrategy):
+        name = "alt"
+        installs_via_registry = True
+
+        def build_attention(self, base_attn_fn, ctx):
+            return _AltAttention(ctx.group, base_attn_fn)
+
+    class _TwoAttnModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _Config("_sp_test_base", 4)
+            self.attn_a = _StubAttention(self.config)
+            self.attn_b = _StubAttention(self.config)
+            self.attn_alt = _StubAttention(self.config)
+
+    model = _TwoAttnModel()
+    routes = {id(model.attn_alt): _AltStrategy}
+
+    def dispatch(module):
+        if sp.is_attention_module(module):
+            return routes.get(id(module), sp.UlyssesStrategy)()
+        return None
+
+    sp.enable_sequence_parallel(model, sp_world1, dispatch=dispatch)
+    assert isinstance(model.attn_a._sp_handler, sp.UlyssesAttention)
+    assert isinstance(model.attn_alt._sp_handler, _AltAttention)  # not collapsed onto the first strategy
+    assert model.attn_a._sp_handler is model.attn_b._sp_handler  # same strategy type -> shared handler
 
 
 # --------------------------------------------------------------------------- USP seam
@@ -343,3 +470,20 @@ def test_dataloader_routes_shard_layout_through_strategy(sp_world1):
     assert marked == [{"marked": True}]  # strategy.shard_batch owns the layout
     # default (no strategy) -> contiguous shard_sequence_batch
     assert "position_ids" in list(sp.SequenceShardingDataLoader(dl, sp_world1))[0]
+
+
+def test_dataloader_delegates_attributes(sp_world1):
+    # trainer code touches the usual DataLoader surface (batch_size, dataset, ...) on the wrapper
+    inner = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(torch.arange(8)), batch_size=2)
+    wrapped = sp.SequenceShardingDataLoader(inner, sp_world1)
+    assert wrapped.batch_size == 2
+    assert wrapped.dataset is inner.dataset
+    assert len(wrapped) == len(inner)
+    with pytest.raises(AttributeError):
+        wrapped.not_a_dataloader_attribute
+
+
+def test_dataloader_rejects_non_mapping_batches(sp_world1):
+    wrapped = sp.SequenceShardingDataLoader([(torch.arange(4),)], sp_world1)  # tuple batch
+    with pytest.raises(TypeError, match="dict-style"):
+        next(iter(wrapped))

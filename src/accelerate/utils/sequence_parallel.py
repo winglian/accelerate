@@ -1,4 +1,4 @@
-# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -27,9 +27,13 @@ leg stubbed. `register_sp_strategy` / `register_sp_model_hook` are the extension
 
 `shard_sequence_batch` builds global position_ids/shift_labels, pads the sequence to a multiple of the
 sp size (so shards are even), and shards contiguously. Packed/varlen cu_seqlens are self-derived inside
-the attention from the sharded position_ids, so there is no dataloader -> handler side channel.
+the attention from the sharded position_ids, so there is no dataloader -> handler side channel: flash
+impls get the varlen indices, sdpa/eager get the equivalent block-diagonal mask rebuilt for the
+gathered sequence. Padding masks are honored only as right-padding (safe under causal attention);
+left/interior padding is rejected at sharding time.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,45 +122,93 @@ class UlyssesAttention:
         self.sp_group = sp_group
         self.sp_size = dist.get_world_size(sp_group)
         self.attn_fn = attn_fn  # the model's original HF attention, captured before we override it
-        self._cache_ptr = None
+        self._cache_ref = None  # the exact position_ids tensor the varlen cache was derived from
         self._cu_seqlens = None
         self._max_seqlen = None
+        self._global_pos = None  # gathered full-sequence positions, kept to rebuild a packed mask
+        self._mask_cache = None
+
+    @property
+    def cu_seqlens(self):
+        return self._cu_seqlens
+
+    @property
+    def max_seqlen(self):
+        return self._max_seqlen
 
     def set_varlen(self, cu_seqlens, max_seqlen):  # noqa: D401 - back-compat shim
         """Deprecated no-op: varlen ``cu_seqlens`` are now self-derived from ``position_ids``."""
 
-    def _global_cu_seqlens(self, local_position_ids):
+    def _global_cu_seqlens(self, local_position_ids, device=None):
         """GLOBAL packed cu_seqlens (or ``(None, None)`` when unpacked) from the rank-local
         ``position_ids`` the model threads in: all-gather across the sp group to rebuild the
-        full-sequence positions, then read the doc boundaries. Memoized on the ``position_ids`` storage
-        so N attention layers share one gather per step — no dataloader -> handler side channel."""
+        full-sequence positions, then read the doc boundaries. Memoized on tensor IDENTITY: the model
+        threads ONE position_ids tensor through every layer, so N layers share one gather per forward,
+        and a new batch is a new tensor, so every rank re-gathers together. Identity, not `data_ptr`
+        — the held reference keeps the cached tensor alive, so the allocator can never hand a new
+        batch the same pointer with different contents (which would silently reuse stale boundaries
+        and desync the collective across ranks)."""
         if local_position_ids is None or self.sp_size == 1:
             return None, None
-        key = local_position_ids.data_ptr()
-        if key != self._cache_ptr:
-            gathered = [torch.empty_like(local_position_ids) for _ in range(self.sp_size)]
-            dist.all_gather(gathered, local_position_ids.contiguous(), group=self.sp_group)
+        if local_position_ids is not self._cache_ref:
+            local = local_position_ids.contiguous()
+            if device is not None and local.device != device:
+                local = local.to(device)
+            gathered = [torch.empty_like(local) for _ in range(self.sp_size)]
+            dist.all_gather(gathered, local, group=self.sp_group)
             global_pos = torch.cat(gathered, dim=-1)
             packed = int((global_pos[0] == 0).sum()) > 1
             self._cu_seqlens, self._max_seqlen = _cu_seqlens_from_position_ids(global_pos) if packed else (None, None)
-            self._cache_ptr = key
+            self._global_pos = global_pos if packed else None
+            self._mask_cache = None
+            self._cache_ref = local_position_ids
         return self._cu_seqlens, self._max_seqlen
+
+    def _packed_attention_mask(self, dtype, device):
+        """Additive [b, 1, S, S] block-diagonal causal mask over the gathered full sequence, rebuilt
+        from the global position_ids — the same mask transformers' masking_utils derives from packed
+        position_ids at sp=1 (the model built its mask for the LOCAL shard, which we drop). Costs
+        O(S^2) like any non-varlen packed mask; flash varlen avoids it via cu_seqlens."""
+        if self._mask_cache is None or self._mask_cache.device != device or self._mask_cache.dtype != dtype:
+            pos = self._global_pos
+            seg = (torch.diff(pos, prepend=pos[:, :1] - 1, dim=-1) != 1).cumsum(-1)  # doc id per token
+            keep = seg[:, None, :, None] == seg[:, None, None, :]  # same-doc [b, 1, S, S]
+            length = pos.shape[-1]
+            keep = keep & torch.tril(torch.ones(length, length, dtype=torch.bool, device=pos.device))
+            mask = torch.zeros(keep.shape, dtype=dtype, device=device)
+            self._mask_cache = mask.masked_fill_(~keep.to(device), torch.finfo(dtype).min)
+        return self._mask_cache
 
     def __call__(self, module, query, key, value, attention_mask, **kwargs):
         group, sp = self.sp_group, self.sp_size
-        cu_seqlens, max_seqlen = self._global_cu_seqlens(kwargs.get("position_ids"))
+        cu_seqlens, max_seqlen = self._global_cu_seqlens(kwargs.get("position_ids"), device=query.device)
         # heads -> full sequence, then to HF's [b, h, S, d] layout
         q = GatherSeqScatterHeads.apply(query, group, sp).transpose(1, 2)
         k = GatherSeqScatterHeads.apply(key, group, sp).transpose(1, 2)
         v = GatherSeqScatterHeads.apply(value, group, sp).transpose(1, 2)
         # Drop the LOCAL-shard kwargs (position_ids + flash varlen indices keyed to the pre-gather
-        # length); re-inject the GLOBAL packed cu_seqlens for the full sequence the all-to-all rebuilt.
+        # length, plus the local-length mask); packed boundaries are re-established for the full
+        # sequence below, and an all-ones/right-padded mask is safely dropped (causal attention only
+        # lets pad queries — whose labels are masked — see the trailing pad keys).
         for k_ in ("position_ids", "cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
             kwargs.pop(k_, None)
+        inner_mask = None
         if cu_seqlens is not None:
-            kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = cu_seqlens.to(q.device)
-            kwargs["max_length_q"] = kwargs["max_length_k"] = max_seqlen
-        out, _ = self.attn_fn(module, q, k, v, None, **kwargs)
+            impl = getattr(getattr(module, "config", None), "_attn_implementation", "")
+            if "flash" in impl:
+                # flash consumes the varlen indices directly
+                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = cu_seqlens.to(q.device)
+                kwargs["max_length_q"] = kwargs["max_length_k"] = max_seqlen
+            elif impl in ("sdpa", "eager"):
+                # sdpa/eager ignore cu_seq_lens kwargs: hand them the equivalent dense mask instead
+                inner_mask = self._packed_attention_mask(q.dtype, q.device)
+            else:
+                raise NotImplementedError(
+                    f"Packed/varlen sequences under native SP require a flash attention implementation "
+                    f"(or sdpa/eager, for which the packed mask is rebuilt), got "
+                    f"attn_implementation={impl!r}."
+                )
+        out, _ = self.attn_fn(module, q, k, v, inner_mask, **kwargs)
         return GatherHeadsScatterSeq.apply(out, group, sp), None
 
 
@@ -337,10 +389,9 @@ def _make_sp_dispatcher(base):
     return dispatcher
 
 
-def _install_registry_attention(model, attn_modules, strategy, ctx):
-    """Install the per-module dispatcher under the model's ``_attn_implementation`` and tag the given
-    attention modules with this model's handler. ``_attn_implementation`` is left unchanged. Returns
-    the handler."""
+def _ensure_sp_dispatcher(model):
+    """Install (once) the per-module dispatcher under the model's ``_attn_implementation`` key and
+    return the unwrapped base attention. ``_attn_implementation`` itself is left unchanged."""
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     impl = model.config.get_text_config()._attn_implementation
@@ -348,6 +399,14 @@ def _install_registry_attention(model, attn_modules, strategy, ctx):
     base = getattr(current, "_sp_base", current)  # unwrap if the dispatcher is already installed
     if getattr(current, "_sp_base", None) is None:
         ALL_ATTENTION_FUNCTIONS[impl] = _make_sp_dispatcher(base)
+    return base
+
+
+def _install_registry_attention(model, attn_modules, strategy, ctx):
+    """Install the per-module dispatcher under the model's ``_attn_implementation``, build the
+    strategy's handler over the real base attention, and tag the given attention modules with it.
+    Returns the handler."""
+    base = _ensure_sp_dispatcher(model)
     handler = strategy.build_attention(base, ctx)
     for module in attn_modules:
         module._sp_handler = handler
@@ -373,13 +432,20 @@ def enable_sequence_parallel(model, sp_group, strategy=None, backend="ulysses", 
         assigned = [(m, s) for m, s in assigned if s is not None]
         for _, strat in assigned:
             strat.validate(model, ctx)
-        attn_modules = [m for m, s in assigned if s.installs_via_registry]
+        # One handler per registry-strategy TYPE (dispatch builds a fresh instance per module, so the
+        # type is the identity): modules routed to the same strategy share one handler — and one
+        # per-step varlen gather. A registry strategy needing per-module configuration should install
+        # via `wrap_module` instead.
         handler = None
-        if attn_modules:
-            strat = next(s for _, s in assigned if s.installs_via_registry)
-            handler = _install_registry_attention(model, attn_modules, strat, ctx)
+        handlers_by_type = {}
         for module, strat in assigned:
-            if not strat.installs_via_registry:
+            if strat.installs_via_registry:
+                shared = handlers_by_type.get(type(strat))
+                if shared is None:
+                    shared = handlers_by_type[type(strat)] = _install_registry_attention(model, [], strat, ctx)
+                module._sp_handler = shared
+                handler = handler or shared
+            else:
                 strat.wrap_module(module, ctx.group)
         for hook in _SP_MODEL_HOOKS:
             hook(model, ctx.group)
@@ -404,8 +470,12 @@ def enable_ulysses_sp(model, sp_group):
 def _pad_sequence_to_multiple(batch, multiple, seq_dim, ignore_index):
     """Right-pad the sequence-dim tensors to a multiple of ``multiple``. Pads are label-masked and
     ``position_ids`` continue from the last position, so they add no loss and form no varlen boundary."""
-    ids = batch["input_ids"]
-    pad_len = (-ids.shape[seq_dim]) % multiple
+    ref = next(
+        (batch[k] for k in ("input_ids", "position_ids", "labels", "shift_labels") if batch.get(k) is not None), None
+    )
+    if ref is None:
+        return batch
+    pad_len = (-ref.shape[seq_dim]) % multiple
     if pad_len == 0:
         return batch
 
@@ -455,11 +525,23 @@ def shard_sequence_batch(batch, shard_group, attention=None, seq_dim=1, ignore_i
         shift = torch.full_like(labels, ignore_index)
         shift[..., :-1] = labels[..., 1:]
         batch["shift_labels"] = shift
-    # 3. pad to a multiple of the world size so the shard is EVEN (uneven shards are a hard Ulysses
+    # 3. reject padding layouts the attention cannot honor: the Ulysses attention runs on the
+    # gathered full sequence WITHOUT the padding mask, which is only safe for right-padding (under
+    # causal attention pad keys are visible solely to pad queries, whose labels are masked).
+    # Left/interior padding would silently attend wrong, so fail loudly instead.
+    mask = batch.get("attention_mask")
+    if world > 1 and mask is not None and seq_dim == 1 and mask.dim() == 2:
+        if (mask[..., :-1] < mask[..., 1:]).any():
+            raise ValueError(
+                "Native SP received an attention_mask with left/interior padding; only right-padding "
+                "is supported, because the Ulysses attention drops the padding mask when it runs on "
+                "the gathered full sequence. Pack sequences or right-pad instead."
+            )
+    # 4. pad to a multiple of the world size so the shard is EVEN (uneven shards are a hard Ulysses
     # all-to-all size mismatch); pads are label-masked and continue position_ids (no varlen boundary).
     if world > 1:
         batch = _pad_sequence_to_multiple(batch, world, seq_dim, ignore_index)
-    # 4. contiguous (even) sequence shard. varlen cu_seqlens are self-derived in the attention from the
+    # 5. contiguous (even) sequence shard. varlen cu_seqlens are self-derived in the attention from the
     # sharded position_ids, so there is no side channel here (`attention` is unused).
     if world > 1:
         for key in ("input_ids", "labels", "position_ids", "shift_labels", "attention_mask"):
@@ -502,8 +584,22 @@ class SequenceShardingDataLoader:
     def __len__(self):
         return len(self.dataloader)
 
+    def __getattr__(self, name):
+        # Delegate everything else (set_epoch, total_batch_size, batch_sampler, dataset, ...) to the
+        # wrapped loader so trainer code sees the usual accelerate DataLoader surface.
+        try:
+            dataloader = self.__dict__["dataloader"]
+        except KeyError:
+            raise AttributeError(name) from None
+        return getattr(dataloader, name)
+
     def __iter__(self):
         for batch in self.dataloader:
+            if not isinstance(batch, Mapping):
+                raise TypeError(
+                    f"SequenceShardingDataLoader needs dict-style batches with 'input_ids' to shard "
+                    f"the sequence, got {type(batch).__name__}; return a mapping from your collate_fn."
+                )
             yield self._process(dict(batch))
 
     def _process(self, batch):

@@ -113,7 +113,7 @@ class ParallelismConfig:
             {
                 k: copy.deepcopy(v.__dict__) if hasattr(v, "__dict__") else v
                 for k, v in self.__dict__.items()
-                if k not in _non_serializable_fields
+                if k not in _non_serializable_fields and not k.startswith("_")
             }
         )
 
@@ -295,10 +295,18 @@ class ParallelismConfig:
         return tuple(zip(*sorted_items))
 
     def __post_init__(self):
-        # Track whether the user explicitly chose a backend (vs. leaving it to auto-resolve from
-        # the training engine in `_resolve_backends`). Env-set counts as explicit. Must be read
-        # BEFORE the defaulting below overwrites None.
+        # Track whether the user explicitly chose a backend / handler (vs. leaving them to
+        # auto-resolve from the training engine in `_resolve_backends`). Env-set counts as explicit.
+        # Must be read BEFORE the defaulting below overwrites None.
         self._sp_backend_explicit = self.sp_backend is not None or "PARALLELISM_CONFIG_SP_BACKEND" in os.environ
+        self._sp_handler_explicit = self.sp_handler is not None
+        if self.sp_backend is None and self.sp_handler is not None:
+            # An explicit handler names the backend unambiguously — infer instead of hitting the
+            # env default below and raising on the (handler, backend) mismatch.
+            self.sp_backend = (
+                "accelerate" if isinstance(self.sp_handler, AccelerateSequenceParallelConfig) else "deepspeed"
+            )
+            self._sp_backend_explicit = True
 
         # Basic size validation
         if self.dp_replicate_size is None:
@@ -411,12 +419,24 @@ class ParallelismConfig:
             self.sp_backend = "deepspeed" if is_deepspeed else "accelerate"
         elif self.sp_backend == "deepspeed" and not is_deepspeed:
             # ALST needs the DeepSpeed engine; fall back to native Ulysses (runs under FSDP2 / DDP).
+            warnings.warn(
+                "sp_backend='deepspeed' (ALST) requires the DeepSpeed engine, but the current "
+                f"distributed type is {accelerator.distributed_type}; falling back to the native "
+                "sp_backend='accelerate' Ulysses implementation.",
+                UserWarning,
+            )
             self.sp_backend = "accelerate"
 
         handler_cls = (
             DeepSpeedSequenceParallelConfig if self.sp_backend == "deepspeed" else AccelerateSequenceParallelConfig
         )
         if not isinstance(self.sp_handler, handler_cls):
+            if getattr(self, "_sp_handler_explicit", False) and self.sp_handler is not None:
+                warnings.warn(
+                    f"Replacing the provided sp_handler {type(self.sp_handler).__name__} with "
+                    f"{handler_cls.__name__} to match the resolved sp_backend='{self.sp_backend}'.",
+                    UserWarning,
+                )
             self.sp_handler = handler_cls()
 
     def _validate_accelerator(self, accelerator: "Accelerator"):

@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 
 from parameterized import parameterized
@@ -59,3 +60,13 @@ class AccelerateUlyssesSPTest(TempDirTestCase):
     @parameterized.expand(["ddp", "fsdp"])
     def test_ulysses_sp_x_dp(self, engine):  # 4 GPUs: dp=2 x sp=2
         self._launch(4, [f"--engine={engine}", "--sp-size=2"])
+
+    @unittest.skipUnless(device_count >= 4, "parity (dp=2,sp=1 vs dp=2,sp=2) requires >= 4 devices")
+    @parameterized.expand(["ddp", "fsdp"])
+    def test_ulysses_sp_parity_vs_sp1(self, engine):
+        # THE correctness check: Ulysses only splits the sequence, so with the same dp the global
+        # token-weighted loss trajectory must not depend on sp. Run the sp=1 reference (2 procs,
+        # dp=2), then the sp=2 run (4 procs, dp=2 x sp=2) against it.
+        ref = os.path.join(self.tmpdir, f"sp1_ref_{engine}.json")
+        self._launch(2, [f"--engine={engine}", "--sp-size=1", f"--save-ref={ref}"])
+        self._launch(4, [f"--engine={engine}", "--sp-size=2", f"--ref={ref}"])

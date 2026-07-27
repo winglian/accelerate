@@ -273,5 +273,24 @@ class TestParallelismConfig:
         with pytest.raises(ValueError, match="Invalid sp_attn_implementation"):
             DeepSpeedSequenceParallelConfig(sp_attn_implementation="foobar")
 
+    def test_sp_accelerate_handler_and_backend_inference(self):
+        """The native ('accelerate') sp backend needs no DeepSpeed; an explicit handler names the
+        backend, so it is inferred rather than colliding with the 'deepspeed' env default."""
+        from accelerate.utils import AccelerateSequenceParallelConfig
+
+        pc = ParallelismConfig(sp_backend="accelerate", sp_size=2)
+        assert isinstance(pc.sp_handler, AccelerateSequenceParallelConfig)
+
+        # handler given, backend left unset -> inferred from the handler type (must not raise)
+        pc = ParallelismConfig(sp_size=2, sp_handler=AccelerateSequenceParallelConfig())
+        assert pc.sp_backend == "accelerate"
+
+    def test_to_json_omits_private_fields(self):
+        pc = ParallelismConfig(dp_replicate_size=2)
+        serialized = pc.to_json()
+        assert serialized is not None, "to_json must return the mapping"
+        assert not any(k.startswith("_") for k in serialized), f"private fields leaked: {sorted(serialized)}"
+        assert "device_mesh" not in serialized
+
     def test_tp_handler(self):
         assert True, "Tensor parallelism handler doesn't hold any logic yet"

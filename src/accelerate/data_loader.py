@@ -1097,6 +1097,10 @@ def prepare_data_loader(
             This requires `torchdata` version 0.8.0 or higher that supports StatefulDataLoader to be installed."
         torch_device_mesh (`torch.distributed.DeviceMesh`, *optional*, defaults to `None`):
             PyTorch device mesh.
+        parallelism_config (`ParallelismConfig`, *optional*, defaults to `None`):
+            The parallelism configuration, used to decide which mesh dimensions receive the same batch: ranks that
+            only shard the sequence (native `sp`, `cp`) or the model (`tp`) are handed the same samples, so only the
+            data-parallel dimensions split the dataset.
 
 
     Returns:

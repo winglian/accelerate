@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -109,13 +109,13 @@ def main():
         probe = next(iter(dl))
         assert probe["input_ids"].shape[1] == SEQLEN // sp_world, "sequence was not sharded over sp"
         assert "shift_labels" in probe and "position_ids" in probe, "missing shift_labels / position_ids"
-        if args.packed:
-            assert accelerator._sp_attention.cu_seqlens is not None, "packed batch did not set cu_seqlens"
 
     # First batch (sequence-sharded when sp>1; full when sp=1 -> build shift_labels / position_ids).
     batch = {k: v.to(device) for k, v in next(iter(dl)).items()}
     if "position_ids" not in batch:
-        batch["position_ids"] = torch.arange(batch["input_ids"].shape[1], device=device)[None].expand_as(batch["input_ids"])
+        batch["position_ids"] = torch.arange(batch["input_ids"].shape[1], device=device)[None].expand_as(
+            batch["input_ids"]
+        )
     if "shift_labels" not in batch:
         batch["shift_labels"] = shifted(batch["labels"])
 
@@ -134,6 +134,9 @@ def main():
     losses = []
     for step in range(STEPS):
         out = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])
+        if step == 0 and sp > 1 and args.packed:
+            # cu_seqlens are self-derived by the attention from position_ids during the forward
+            assert accelerator._sp_attention.cu_seqlens is not None, "packed batch did not derive cu_seqlens"
         loss = unwrapped.loss_function(
             logits=out.logits, labels=None, shift_labels=batch["shift_labels"], vocab_size=vocab
         )
@@ -141,7 +144,9 @@ def main():
         accelerator.backward(loss)
         optimizer.step()
         optimizer.zero_grad()
-        accelerator.print(f"[{args.engine} dp{dp}xsp{sp}{' packed' if args.packed else ''}] step {step}: {losses[-1]:.5f}")
+        accelerator.print(
+            f"[{args.engine} dp{dp}xsp{sp}{' packed' if args.packed else ''}] step {step}: {losses[-1]:.5f}"
+        )
 
     assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
     if args.save_ref and accelerator.is_main_process:

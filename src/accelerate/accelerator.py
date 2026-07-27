@@ -472,6 +472,10 @@ class Accelerator:
         )
 
         if self.parallelism_config:
+            # Resolve engine-dependent backends BEFORE building the mesh: `build_device_mesh` skips
+            # mesh creation for the deepspeed/ALST sp backend, so resolving afterwards would leave a
+            # config that auto-resolves to the native backend without a device mesh.
+            self.parallelism_config._resolve_backends(self)
             self.state.device_mesh = self.parallelism_config.get_device_mesh(self.device.type)
             self.parallelism_config._validate_accelerator(self)
 
@@ -620,6 +624,7 @@ class Accelerator:
         self._schedulers = []
         self._dataloaders = []
         self._custom_objects = []
+        self._sp_attention = None  # native-SP attention handler, set by `_prepare_sp`
 
         # Hooks
         self._load_model_state_pre_hook = OrderedDict()
@@ -1683,12 +1688,12 @@ class Accelerator:
 
         from .utils.sequence_parallel import enable_ulysses_sp
 
-        self._sp_attention = None
         sp_group = self.torch_device_mesh["sp"].get_group()
         for arg in args:
             if isinstance(arg, torch.nn.Module):
-                # the handler is stashed so `prepare` can wire a packed dataloader to push per-step
-                # cu_seqlens onto it (`handler.set_varlen`).
+                # The handler is stashed for callers that shard already-materialized batches at the
+                # forward (e.g. GRPO rollouts). Preserved across `prepare` calls so a dataloader-only
+                # call doesn't clobber the handler from an earlier model-only call.
                 self._sp_attention = enable_ulysses_sp(arg, sp_group)
 
         return args
@@ -1697,14 +1702,15 @@ class Accelerator:
         """Wrap each prepared DataLoader in a `SequenceShardingDataLoader` that shards the sequence
         contiguously over the `sp` group. `prepare_data_loader` already hands sp ranks the same
         sample (dp-aware sharding divides out tp*cp*sp), so the wrapper only does the sequence
-        split; packed cu_seqlens are pushed onto the handler (`set_varlen`)."""
+        split; packed/varlen cu_seqlens are self-derived by the attention from position_ids, so the
+        wrapper needs no handle on it (models and dataloaders may be prepared in any order)."""
         from .utils.sequence_parallel import SequenceShardingDataLoader
 
         shard_group = self.torch_device_mesh["sp"].get_group()
         wrapped = []
         for obj in result:
             if isinstance(obj, torch.utils.data.DataLoader) and not isinstance(obj, SequenceShardingDataLoader):
-                obj = SequenceShardingDataLoader(obj, shard_group, attention=self._sp_attention)
+                obj = SequenceShardingDataLoader(obj, shard_group)
             wrapped.append(obj)
         return tuple(wrapped)
 
